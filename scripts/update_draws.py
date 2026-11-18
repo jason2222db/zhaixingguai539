@@ -26,7 +26,7 @@ def validate(row):
             and isinstance(nums, list) and len(nums) == 5
             and all(type(n) is int and 1 <= n <= 39 for n in nums)
             and len(set(nums)) == 5
-            and isinstance(issue, str) and issue.isdigit() and len(issue) in (8, 9))
+            and isinstance(issue, str) and (issue == '' or (issue.isdigit() and len(issue) in (8, 9))))
 
 
 def month_shift(y, m, offset):
@@ -58,22 +58,22 @@ def parse(item):
     except (TypeError, ValueError):
         return None
     row = {'date': date, 'issue': issue, 'nums': nums}
-    return row if validate(row) else None
+    return row if validate(row) and row['issue'] != '' else None
 
 
 def main():
     if not PATH.exists():
-        raise RuntimeError('找不到 draws.json；請確認已上傳至儲存庫根目錄')
+        raise RuntimeError('找不到 draws.json；請確認檔案位於儲存庫根目錄')
     existing = json.loads(PATH.read_text(encoding='utf-8-sig'))
     if not isinstance(existing, list) or len(existing) < 6000 or not all(validate(r) for r in existing):
-        raise RuntimeError('原有歷史資料異常，停止更新以避免破壞資料')
-    by_date = {}
-    by_issue = {}
-    for r in existing:
-        if r['date'] in by_date or r['issue'] in by_issue:
-            raise RuntimeError('原有資料出現重複日期或期別，停止更新')
-        by_date[r['date']] = r
-        by_issue[r['issue']] = r
+        raise RuntimeError('原有歷史資料格式或號碼異常，停止更新')
+    dates = [r['date'] for r in existing]
+    issues = [r['issue'] for r in existing if r['issue']]
+    if dates != sorted(dates) or len(set(dates)) != len(dates) or len(set(issues)) != len(issues):
+        raise RuntimeError('原有資料日期順序、重複日期或期別異常，停止更新')
+
+    by_date = {r['date']: dict(r) for r in existing}
+    by_issue = {r['issue']: r['date'] for r in existing if r['issue']}
     now = dt.datetime.now(TZ)
     months = [month_shift(now.year, now.month, -1), month_shift(now.year, now.month, 0)]
     incoming = []
@@ -82,35 +82,42 @@ def main():
     if not incoming:
         raise RuntimeError('官方未回傳任何開獎資料，不更新')
     parsed = [parse(item) for item in incoming]
-    if not any(parsed):
-        raise RuntimeError('官方資料無法安全解析日期與五顆號碼，不更新')
-    if any(p is None for p in parsed):
-        raise RuntimeError('官方資料含無效項目，不更新；請檢查官方格式')
+    if not any(parsed) or any(p is None for p in parsed):
+        raise RuntimeError('官方資料無法安全解析，停止更新')
+
     additions = []
+    repairs = 0
     for r in sorted(parsed, key=lambda x: x['date']):
-        old_date = by_date.get(r['date'])
-        old_issue = by_issue.get(r['issue'])
-        if old_date or old_issue:
-            if (old_date is None or old_issue is None
-                or old_date['date'] != old_issue['date']
-                or old_date['nums'] != r['nums']):
-                raise RuntimeError(f'資料衝突 {r["date"]} {r["issue"]}，不覆蓋舊資料')
-            continue
-        if r['date'] <= existing[-1]['date']:
-            raise RuntimeError(f'發現缺漏的舊日期 {r["date"]}，請人工檢查')
-        by_date[r['date']] = r
-        by_issue[r['issue']] = r
-        additions.append(r)
-    if not additions:
-        print(f'無新資料；最新 {existing[-1]["date"]} {existing[-1]["nums"]}')
+        date, issue = r['date'], r['issue']
+        prior_date = by_issue.get(issue)
+        if prior_date is not None and prior_date != date:
+            raise RuntimeError(f'官方期別 {issue} 與原有日期衝突，停止更新')
+        old = by_date.get(date)
+        if old is not None:
+            if old['nums'] != r['nums']:
+                raise RuntimeError(f'官方號碼與既有資料衝突：{date}，停止更新')
+            if old['issue'] and old['issue'] != issue:
+                raise RuntimeError(f'官方期別與既有資料衝突：{date}，停止更新')
+            if not old['issue']:
+                old['issue'] = issue  # Only fill when date AND five numbers match official response
+                repairs += 1
+        else:
+            if date <= existing[-1]['date']:
+                raise RuntimeError(f'發現缺漏的歷史日期 {date}，停止更新並請人工核對')
+            by_date[date] = r
+            additions.append(r)
+        by_issue[issue] = date
+
+    combined = [by_date[r['date']] for r in existing] + additions
+    if not all(validate(r) for r in combined):
+        raise RuntimeError('更新後驗證失敗，拒絕寫入')
+    if not additions and not repairs:
+        print(f'無新資料；最新 {existing[-1]["date"]}')
         return
-    combined = existing + additions
-    if len({r['date'] for r in combined}) != len(combined):
-        raise RuntimeError('日期重複，拒絕寫入')
     temp = PATH.with_suffix('.json.tmp')
     temp.write_text(json.dumps(combined, ensure_ascii=False, separators=(',', ':')), encoding='utf-8')
     temp.replace(PATH)
-    print(f'新增 {len(additions)} 期；最新 {combined[-1]["date"]} {combined[-1]["nums"]}')
+    print(f'新增 {len(additions)} 期，核對官方資料補齊 {repairs} 筆期別；最新 {combined[-1]["date"]}')
 
 
 if __name__ == '__main__':
